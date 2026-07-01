@@ -1,6 +1,8 @@
 ## csapp-lab
 https://csapp.cs.cmu.edu/3e/labs.html
 
+**环境配置（macOS / Apple Silicon）**：见 [SETUP-cn.md](SETUP-cn.md)，使用 `./lab.sh` 在 Docker 中编译运行实验。
+
 Lab Assignments
 This page contains a complete set of turnkey labs for the CS:APP3e text. The labs all share some common features. Each lab is distributed in a self-contained tar file. You will need a CS:APP account to download the code. To untar , type "" to the Unix shell. This will create a directory called "" that contains all of the material for the lab. foo.tartar xvf foo.tarfoo
 

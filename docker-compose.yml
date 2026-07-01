@@ -1,0 +1,23 @@
+services:
+  csapp:
+    build:
+      context: .
+      platforms:
+        - linux/amd64
+    image: csapp:amd64
+    platform: linux/amd64
+    volumes:
+      - .:/csapp
+    working_dir: /csapp
+    stdin_open: true
+    tty: true
+    command: bash
+
+  # 复用 csapp 镜像，不单独 build：docker compose run --rm datalab-test
+  datalab-test:
+    image: csapp:amd64
+    platform: linux/amd64
+    volumes:
+      - .:/csapp
+    working_dir: /csapp/no1-datalab
+    command: bash -lc "make btest && ./btest"
