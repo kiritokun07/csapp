@@ -141,9 +141,63 @@ NOTES:
  *   Legal ops: ~ &
  *   Max ops: 14
  *   Rating: 1
+
+~x
+~0 = 1
+~1 = 0
+
+x & y
+0 & 0 = 0
+0 & 1 = 0
+1 & 0 = 0
+1 & 1 = 1
+
+~x & y
+1 & 0 = 0
+1 & 1 = 1
+0 & 0 = 0
+0 & 1 = 0
+
+x & ~y
+0 & 1 = 0
+0 & 0 = 0
+1 & 1 = 1
+1 & 0 = 0
+
+~(x & ~y)
+0 & 1 = 1
+0 & 0 = 1
+1 & 1 = 0
+1 & 0 = 1
+
+~x & ~y
+1 & 1 = 1
+1 & 0 = 0
+0 & 1 = 0
+0 & 0 = 0
+
+~(~x & ~y)
+1 & 1 = 0
+1 & 0 = 1
+0 & 1 = 1
+0 & 0 = 1
+
+
+~(x & y)
+0 & 0 = 1
+0 & 1 = 1
+1 & 0 = 1
+1 & 1 = 0
+
+
+x ^ y
+ 0 ^ 0 = 0
+ 0 ^ 1 = 1
+ 1 ^ 0 = 1
+ 1 ^ 1 = 0
  */
 int bitXor(int x, int y) {
-  return 2;
+  return (~(~x & ~y)) & ~(x & y);
 }
 /* 
  * tmin - return minimum two's complement integer 
@@ -152,9 +206,7 @@ int bitXor(int x, int y) {
  *   Rating: 1
  */
 int tmin(void) {
-
-  return 2;
-
+  return 1<<31;
 }
 //2
 /*
@@ -176,7 +228,8 @@ int isTmax(int x) {
  *   Rating: 2
  */
 int allOddBits(int x) {
-  return 2;
+  int mask = 0xAA|0xAA<<8|0xAA<<16|0xAA<<24;
+  return !((x & mask) ^ mask);
 }
 /* 
  * negate - return -x 
@@ -186,7 +239,7 @@ int allOddBits(int x) {
  *   Rating: 2
  */
 int negate(int x) {
-  return 2;
+  return ~x + 1;
 }
 //3
 /* 
@@ -199,7 +252,9 @@ int negate(int x) {
  *   Rating: 3
  */
 int isAsciiDigit(int x) {
-  return 2;
+  //先取前4位，判断等于0x30
+  //再取后4位，判断在0～9之间
+  return !((x&~0xF)^0x30) & (9-(x&0xF))>>31 == 0;
 }
 /* 
  * conditional - same as x ? y : z 
@@ -209,7 +264,8 @@ int isAsciiDigit(int x) {
  *   Rating: 3
  */
 int conditional(int x, int y, int z) {
-  return 2;
+  int mask = -!!x;
+  return (mask&y) | (~mask&z);
 }
 /* 
  * isLessOrEqual - if x <= y  then return 1, else return 0 
@@ -219,7 +275,12 @@ int conditional(int x, int y, int z) {
  *   Rating: 3
  */
 int isLessOrEqual(int x, int y) {
-  return 2;
+  //x==y
+  //x<y
+  //计算x小于y时按下面的逻辑
+  //同号时，x-y的符号位是1
+  //异号时，x的符号位是1，y的符号位是0
+  return !(x^y) | !!((x+(~y+1))>>31) | (x>>31 & !(y>>31));
 }
 //4
 /* 
@@ -231,7 +292,10 @@ int isLessOrEqual(int x, int y) {
  *   Rating: 4 
  */
 int logicalNeg(int x) {
-  return 2;
+  //等于0时返回1 （x和-x的符号位都是0）
+  //不等于0时返回0 x和-x至少有一个首位是1，此时要返回0
+  int isZero = ~(x>>31) & ~((~x+1)>>31);
+  return isZero & 1;
 }
 /* howManyBits - return the minimum number of bits required to represent x in
  *             two's complement
