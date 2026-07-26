@@ -6,6 +6,11 @@ services:
         - linux/amd64
     image: csapp:amd64
     platform: linux/amd64
+    # Bomb Lab：允许 gdb 用 ptrace 调试目标进程
+    cap_add:
+      - SYS_PTRACE
+    security_opt:
+      - seccomp:unconfined
     volumes:
       - .:/csapp
     working_dir: /csapp

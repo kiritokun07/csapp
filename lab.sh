@@ -31,20 +31,19 @@ ensure_image() {
 
 run_in_container() {
   ensure_image
+  # SYS_PTRACE + seccomp=unconfined：允许容器内用 gdb 调试（Bomb Lab 需要）
+  local docker_opts=(
+    --rm
+    --platform linux/amd64
+    --cap-add=SYS_PTRACE
+    --security-opt seccomp=unconfined
+    -v "$ROOT:/csapp"
+    -w /csapp
+  )
   if [ -t 0 ] && [ -t 1 ]; then
-    docker run --rm -it \
-      --platform linux/amd64 \
-      -v "$ROOT:/csapp" \
-      -w /csapp \
-      "$IMAGE" \
-      "$@"
+    docker run -it "${docker_opts[@]}" "$IMAGE" "$@"
   else
-    docker run --rm \
-      --platform linux/amd64 \
-      -v "$ROOT:/csapp" \
-      -w /csapp \
-      "$IMAGE" \
-      "$@"
+    docker run "${docker_opts[@]}" "$IMAGE" "$@"
   fi
 }
 

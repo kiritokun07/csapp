@@ -1,0 +1,176 @@
+CSAPP Bomb Lab（no2-bomblab）完成过程总结
+========================================
+日期：2026-07-26
+环境：macOS Apple Silicon + OrbStack/Docker（linux/amd64 容器）
+
+
+一、实验目标
+------------
+二进制炸弹 bomb 依次要求 6 行输入。输入正确则拆除对应 phase；
+错误则打印 BOOM 并退出。本实验通过反汇编与 GDB 静态读内存，
+理解字符串比较、循环、switch 跳转表、递归、查表、链表等在
+x86-64 汇编中的形态。
+
+
+二、环境启动（Mac 上）
+---------------------
+1. bomb 是 Linux x86-64 ELF，不能直接在本机运行。
+2. 在仓库根目录进入容器：
+     ./lab.sh shell
+     cd no2-bomblab
+     chmod +x bomb
+
+3. 注意：Apple Silicon 上 amd64 容器多为 QEMU 模拟，
+   GDB 的 run/断点调试常报 “Couldn't get registers: Input/output error”。
+   可行做法：
+     - objdump -d bomb > bomb.s   （静态看汇编）
+     - gdb 里用 x/s、x/gx 读地址（不必 run）
+     - 用 ./bomb solution.txt 验证答案
+
+4. lab.sh 已加 SYS_PTRACE / seccomp=unconfined，但在本机模拟下
+   仍无法可靠动态单步；真正要 GDB run 需 x86-64 真机/云主机。
+
+
+三、工作流
+----------
+1. 阅读 bomb.c：了解 main 流程（read_line → phase_n → phase_defused）。
+2. objdump -d / objdump -t：定位 phase_1 … phase_6 地址。
+3. 在 bomb.s 中按函数阅读；对立即数地址用 gdb：x/s、x/gx、x/wd。
+4. 每解一关，把答案追加到 solution.txt（每行末尾必须有换行 \n）。
+5. 验证：./bomb solution.txt
+
+
+四、各关过程与答案
+------------------
+
+【Phase 1】字符串比较
+汇编要点：
+  mov $0x402400, %esi
+  call strings_not_equal
+  相等则过，不等则 explode_bomb
+做法：
+  (gdb) x/s 0x402400
+答案：
+  Border relations with Canada have never been better.
+踩坑：
+  solution.txt 第一行若无末尾换行，read_line 读不完整，直接 BOOM。
+
+
+【Phase 2】六个整数 + 倍增
+汇编要点：
+  call read_six_numbers
+  第一个数必须为 1
+  循环：nums[i] == 2 * nums[i-1]
+答案：
+  1 2 4 8 16 32
+
+
+【Phase 3】scanf 两个整数 + switch 跳转表
+如何看出格式是 "%d %d"：
+  - %rsi 传入格式串地址 0x4025cf，x/s 可读出内容
+  - 准备了两个输出指针；sscanf 返回值要求 > 1（或 phase_4 要求 == 2）
+如何看出 8 个 case：
+  - cmpl $7 + ja → 合法下标 0..7
+  - jmp *0x402470(,%rax,8) → 跳转表 8 项
+输入含义：第一个数选 case(0~7)，第二个数等于该 case 的立即数。
+答案（示例，选 case 0）：
+  0 207
+  （0xcf = 207；其它合法对如 3 256 等也可）
+踩坑：
+  不能把 8 个 case 的值全写在一行；只需「下标 + 对应值」两个数。
+
+
+【Phase 4】两个整数 + 递归 func4
+约束：
+  - 格式 "%d %d"：x 与 y
+  - x 无符号 ≤ 14（0xe）
+  - func4(x, 0, 14) 必须返回 0
+  - y 必须为 0
+func4：在 [low,high] 上二分，根据与 mid 的关系左右递归并编码返回值。
+答案（示例）：
+  1 0
+  （7 0 等使返回值为 0 的 x 也可以；只要路径最终满足返回 0）
+
+
+【Phase 5】长度 6 的字符串 + 查表
+逻辑：
+  string_length == 6
+  result[i] = table[ input[i] & 0xf ]
+  result 必须等于 "flyers"
+表（前 16 字节，0x4024b0）：
+  maduiersnfotvbyl
+目标串（0x40245e）：
+  flyers
+对应下标：f→9, l→f, y→e, e→5, r→6, s→7
+选任意字符使 (ASCII & 0xf) 等于上述下标即可。
+答案（本仓库采用）：
+  Yonefg
+辅助：
+  目录下 ascii.txt 为 0~127 ASCII 对照表，便于查低 4 位。
+
+
+【Phase 6】六个整数 + 链表重排
+约束：
+  - 6 个互不相同的数，每个 ∈ [1,6]
+  - 先做变换：tmp[i] = 7 - input[i]
+  - 按 tmp 取 node1..node6，链成新链表
+  - 要求新链表上 value 降序（当前 >= 下一）
+
+节点（头 0x6032d0，每节点 16 字节：value + index + next）：
+  node1: 332
+  node2: 168
+  node3: 924
+  node4: 691
+  node5: 477
+  node6: 443
+
+按 value 降序的节点编号：
+  3 4 5 6 1 2
+还原输入：input = 7 - 编号
+答案：
+  4 3 2 1 6 5
+
+注意：
+  x/6gx 一次只覆盖 3 个节点（48 字节），需再 x/6gx 0x603300 看 node4~6。
+
+
+五、最终 solution.txt
+---------------------
+Border relations with Canada have never been better.
+1 2 4 8 16 32
+0 207
+1 0
+Yonefg
+4 3 2 1 6 5
+
+运行结果：
+  Congratulations! You've defused the bomb!
+
+
+六、用到的主要命令
+------------------
+  ./lab.sh shell
+  objdump -d bomb > bomb.s
+  objdump -t bomb | grep phase
+  gdb ./bomb
+    (gdb) x/s <addr>
+    (gdb) x/6gx <addr>
+    (gdb) x/wd <addr>
+  ./bomb solution.txt
+
+
+七、额外说明
+------------
+- 二进制中还有 secret_phase（隐藏关），由 phase_defused 等逻辑触发；
+  正课 6 关已完成，隐藏关可选。
+- bomb.c 仅为流程参考，真正判定逻辑在 bomb 二进制中。
+
+
+八、收获（系统视角）
+--------------------
+- 调用约定：%rdi/%rsi/%rdx/%rcx 传参，%eax 返回值
+- 栈上局部数组与 sscanf 输出槽
+- switch → 跳转表；递归 → 栈帧与返回值编码
+- 字符与位运算（& 0xf）在查表中的作用
+- 链表节点在 .data 中的布局与指针跟踪
+- 静态分析在无法可靠动态调试时的替代路径
