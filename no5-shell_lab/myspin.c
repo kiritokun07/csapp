@@ -1,8 +1,11 @@
 /* 
  * myspin.c - A handy program for testing your tiny shell 
+ * myspin.c - 用于测试 tiny shell 的辅助程序
  * 
  * usage: myspin <n>
+ * 用法：myspin <n>
  * Sleeps for <n> seconds in 1-second chunks.
+ * 以每次 1 秒的方式睡眠 <n> 秒。
  *
  */
 #include <stdio.h>
