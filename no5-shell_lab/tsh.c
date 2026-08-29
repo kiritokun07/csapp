@@ -236,8 +236,9 @@ void eval(char *cmdline)
     }
     if (pid == 0) {
         /* 子进程：exec */
+        setpgid(0, 0);
         if (execve(argv[0], argv, environ) < 0) {
-            printf("%s: Command not found.\n", argv[0]);
+            printf("%s: Command not found\n", argv[0]);
             exit(0);   /* 退出的是子进程，shell 还在 */
         }
     } else {
@@ -245,11 +246,16 @@ void eval(char *cmdline)
         if (!bg) {
             addjob(jobs, pid, FG, cmdline);
             int status;
-            waitpid(pid, &status, 0);
-            if(WIFSIGNALED(status)){
-                printf("Job [%d] (%d) terminated by signal %d\n", pid2jid(pid), pid, WTERMSIG(status));
+            waitpid(pid, &status, WUNTRACED);
+            if(WIFSTOPPED(status)){
+                printf("Job [%d] (%d) stopped by signal %d\n", pid2jid(pid), pid, WSTOPSIG(status));
+                getjobpid(jobs, pid)->state = ST;
+            } else {
+                if(WIFSIGNALED(status)){
+                    printf("Job [%d] (%d) terminated by signal %d\n", pid2jid(pid), pid, WTERMSIG(status));
+                }
+                deletejob(jobs, pid);
             }
-            deletejob(jobs, pid);
         } else {
             addjob(jobs, pid, BG, cmdline);
             printf("[%d] (%d) %s", pid2jid(pid), pid, cmdline);
@@ -347,6 +353,16 @@ int builtin_cmd(char **argv)
         return 1;
     }
     /* bg /fg */
+    if (strcmp(argv[0],"fg")==0){
+        /* 继续前台作业 return 1 */
+        do_bgfg(argv);
+        return 1;
+    }
+    if (strcmp(argv[0],"bg")==0){
+        /* 继续后台作业 return 1 */
+        do_bgfg(argv);
+        return 1;
+    }
     return 0;     /* not a builtin command */
                   /* 不是内建命令 */
 }
@@ -357,7 +373,55 @@ int builtin_cmd(char **argv)
  */
 void do_bgfg(char **argv) 
 {
-    return;
+    struct job_t *job = NULL;
+
+    if (argv[1] == NULL) {
+        printf("%s command requires PID or %%jobid argument\n", argv[0]);
+        return;
+    } else if (argv[1][0] == '%') {
+        job = getjobjid(jobs, atoi(argv[1] + 1));
+        if (job == NULL) {
+            printf("%s: No such job\n", argv[1]);  /* 打印 %2 这一串 */
+            return;
+        }
+    } else if (isdigit(argv[1][0])) {
+        job = getjobpid(jobs, atoi(argv[1]));
+        if (job == NULL) {
+            printf("(%s): No such process\n", argv[1]);
+            return;
+        }
+    } else {
+        printf("%s: argument must be a PID or %%jobid\n", argv[0]);
+        return;
+    }
+
+    int jid = atoi(argv[1]+1);
+    job = getjobjid(jobs, jid);
+    if (job == NULL){
+        return;
+    }
+    kill(-job->pid, SIGCONT);
+    if (strcmp(argv[0], "bg") == 0) {
+        /* 继续后台作业 return 1 */
+        job->state = BG;
+        printf("[%d] (%d) %s", job->jid, job->pid, job->cmdline);
+        return;
+    }else if (strcmp(argv[0], "fg") == 0) {
+        int status;
+        job->state = FG;
+        waitpid(job->pid, &status, WUNTRACED);
+    if (WIFSTOPPED(status)) {
+        printf("Job [%d] (%d) stopped by signal %d\n",
+               pid2jid(job->pid), job->pid, WSTOPSIG(status));
+        getjobpid(jobs, job->pid)->state = ST;
+    } else {
+        if (WIFSIGNALED(status)) {
+            printf("Job [%d] (%d) terminated by signal %d\n",
+                   pid2jid(job->pid), job->pid, WTERMSIG(status));
+        }
+        deletejob(jobs, job->pid);
+    }
+    }
 }
 
 /* 
@@ -387,6 +451,7 @@ void waitfg(pid_t pid)
  */
 void sigchld_handler(int sig) 
 {
+
     return;
 }
 
@@ -403,7 +468,7 @@ void sigint_handler(int sig)
     if (pid == 0) {
         return;
     }
-    kill(pid, SIGINT);
+    kill(-pid, SIGINT);
     return;
 }
 
@@ -416,6 +481,11 @@ void sigint_handler(int sig)
  */
 void sigtstp_handler(int sig) 
 {
+    pid_t pid = fgpid(jobs);
+    if (pid == 0) {
+        return;
+    }
+    kill(-pid, SIGTSTP);
     return;
 }
 

@@ -1,0 +1,167 @@
+CSAPP Shell Lab（no5-shell_lab）实验过程总结
+==========================================
+日期：2026-08-29
+环境：macOS Apple Silicon + Docker（./lab.sh shell，Linux x86-64 容器）
+提交文件：tsh.c（只实现指定函数，不改 main / parseline / 作业表辅助函数）
+
+
+一、实验目标
+------------
+实现带作业控制的微型 shell（tsh）：解析命令、内建命令、fork/exec
+外部程序、前台/后台作业、Ctrl-C / Ctrl-Z 转发、bg/fg、进程组。
+
+只需实现：
+  eval, builtin_cmd, do_bgfg, waitfg,
+  sigchld_handler, sigint_handler, sigtstp_handler
+
+验收：make test01 … test16 的输出与 make rtestXX（参考程序 tshref）
+对齐。PID 每次不同，比格式、jid、状态字符串、错误信息。
+
+
+二、环境与工作流
+----------------
+1. tshref 是 Linux ELF x86-64，macOS 上 cannot execute binary file。
+   必须在容器里测：
+     ./lab.sh shell
+     cd no5-shell_lab
+     make clean && make          # 清掉 Mac 上编的 Mach-O
+
+2. 在 Mac 上 make 过再进容器，会提示 Nothing to be done for 'all'：
+   Make 只看文件是否存在、是否比 .c 新，不看 ELF/Mach-O。
+   必须 make clean 后重新编。
+
+3. 每个 traceXX.txt 第一行注释就是本关考点。Makefile 里
+   testXX / rtestXX 一一对应。做法：先 rtest 看标准输出，再改代码，
+   再 test 对照。改完必须看到 gcc 编过 tsh.c，否则仍是旧二进制。
+
+4. 停住的作业会占着驱动接到的 stdout 管道，sdriver 读不到 EOF
+   会卡住（test08/12/13/16 常见）。有效输出打完即可 Ctrl-C。
+   打断用 Ctrl-C，不要 Ctrl-Z（那会把容器里的 make 停到 bash 作业表里）。
+
+
+三、底层模型
+------------
+三套身份不要混：
+  进程 PID     fork 返回值；waitpid / kill 的对象
+  进程组 PGID  setpgid；kill(-pid, sig) 发给整组
+  作业 Job     jobs[] 里一项：pid、jid、state、cmdline
+
+状态机（同一时刻最多一个 FG）：
+  FG --Ctrl-Z--> ST --fg--> FG
+                  |--bg--> BG --fg--> FG
+
+键盘 Ctrl-C / Ctrl-Z 由驱动发给 shell 的 PID，不会自动打到作业。
+shell 必须在 handler 里转发给前台作业的进程组。
+shell 自己已安装 handler，空 return 等于吞掉信号，作业继续跑。
+
+fork 之后两个进程从同一条指令继续，内核给不同返回值：
+  子进程 0，父进程得到孩子 PID。子进程 execve，父进程登记/等待。
+
+
+四、按 trace 的实现过程
+----------------------
+
+【trace01】EOF
+main 里 feof → exit，空函数也能过。用来确认容器里 tsh / tshref 能跑。
+
+【trace02】内建 quit
+eval 必须 parseline + 调 builtin_cmd，否则 quit 不会执行。
+builtin_cmd：strcmp(argv[0], "quit")==0 则 exit(0)；是内建返回非 0。
+踩坑：argv[0]=="quit" 比的是指针，要用 strcmp。
+
+【trace03】前台外部命令
+eval：非内建则 fork；子进程 execve(argv[0], argv, environ)；
+父进程 waitpid。exec 失败打印 Command not found（无句号）后子进程 exit。
+fork 返回值必须存进 pid，父进程才能 waitpid(pid)。
+
+【trace04–05】后台与 jobs
+parseline 的返回值 bg 要在 fork 前接住，只调一次（静态缓冲区）。
+后台：addjob(..., BG, cmdline)，printf("[%d] (%d) %s", jid, pid, cmdline)；
+不要 waitpid，不要再加 \n（cmdline 自带换行）。
+前台也要 addjob(..., FG, ...)，否则后面没有 jid。
+jobs 内建直接 listjobs(jobs)，参数是全局作业表，不是 argv。
+addjob 只登记，不打印那行通知（除非 -v）。
+
+【trace06–07】SIGINT
+sigint_handler：fgpid 为 0 则返回；否则 kill 给前台。
+不要在 handler 里 waitpid / 打印 Job 行。
+eval 里 waitpid(pid, &status, ...)，WIFSIGNALED 时打印
+  Job [%d] (%d) terminated by signal %d
+先 pid2jid 再 deletejob。正常退出也要 deletejob。
+格式不要抄成后台作业那行，也不要带 cmdline（否则会多换行）。
+
+【trace08】SIGTSTP
+sigtstp_handler 与 int 对称，kill 发 SIGTSTP。
+waitpid 第三个参数必须加 WUNTRACED，否则停住的进程不会让 waitpid 返回。
+WIFSTOPPED：打印 stopped by signal（Linux 上 20），state=ST，不要 deletejob。
+停住 ≠ 结束。格式是 Job [jid] (pid) stopped by signal 20，
+不是 bash 的 [2]+  Stopped。
+
+【trace09–10】bg / fg
+builtin_cmd 认出 bg/fg 后 do_bgfg(argv)，return 1。
+未实现时会走 execve("bg") → bg: Command not found。
+查找作业 + kill(-pid, SIGCONT) 共用；
+  bg：state=BG，打印 [jid] (pid) cmdline，不等待；
+  fg：state=FG，再 waitpid(..., WUNTRACED)（与 eval 前台相同）。
+fg 只改 state 就 return 的话，jobs 会显示 Foreground，Ctrl-Z 对不上。
+
+【trace11–13】进程组
+mysplit 会再 fork 孙子。kill(pid, SIGINT) 只打死组长，孙子还在 ps 里。
+子进程 execve 前 setpgid(0, 0)，使作业自成一组（pgid=组长 pid）。
+kill / SIGCONT 一律 kill(-pid, sig) 发给整组。
+只 SIGCONT 组长时：组长卡在 wait() 等仍停着的孙子，fg 会永远卡住。
+trace13 的 fg 之后会再跑约 2 秒，这是正常等待，不要立刻 Ctrl-C。
+
+【trace14】错误信息（必须与 tshref 逐字相同）
+do_bgfg 任何解引用 argv[1] 之前先判 NULL，否则光 fg 会段错误。
+三个互斥分支写在同一组 if/else if/else，% 必须在 else 之前
+（isdigit('%') 为假，%1 否则会被当成非法参数）：
+  无参数     → "%s command requires PID or %%jobid argument"
+  %jid       → getjobjid；失败 "%s: No such job"（打印 argv[1]）
+  数字 pid   → getjobpid(atoi(argv[1]))，不要 +1；失败 "(%s): No such process"
+  其它（a）  → "%s: argument must be a PID or %%jobid"
+printf 里要打出 %jobid 必须写成 %%jobid，否则 %jo 被当成格式符。
+Command not found 不要句号。
+
+【trace15】综合，把上面串起来。
+
+【trace16】mystop/myint 自己给自己发 SIGTSTP/SIGINT，
+不经过 shell 的 int/tstp handler。eval 里 WUNTRACED 的 waitpid
+仍能发现停/死。卡住同 trace08（停住的进程占管道）。
+
+
+五、踩过的坑（按出现顺序）
+--------------------------
+- Mac 上跑 tshref / 容器里沿用 Mach-O
+- listjobs(argv) 类型不匹配；作业表是全局 jobs
+- eval 空着，builtin_cmd 写了也不执行
+- addjob 放在 waitpid 之后；后台仍 waitpid；不 printf 作业行
+- parseline 调用两次；printf 格式随手发明
+- handler 里 waitpid 而不是 kill
+- waitpid 第二参数 NULL，打不出 terminated by signal
+- 停住后仍 deletejob；未加 WUNTRACED
+- fg 未调 do_bgfg；do_bgfg 写死 BG
+- 只 kill 单个 pid，漏掉 mysplit 孙子
+- 改了 kill(-pid) 却没 make
+- argv[1] 未判空；% 分支写在 else return 之后；isdigit 与 getjobjid 混用
+
+
+六、尚未按讲义拆开的部分
+------------------------
+waitfg、sigchld_handler 目前是空的。等待写在 eval / do_bgfg 的 waitpid 里，
+trace01–16 可以过。后台作业正常结束后没有 handler 回收，会留僵尸进程。
+
+讲义期望：
+  sigchld_handler 用 waitpid(-1, &status, WNOHANG|WUNTRACED) 循环回收；
+  waitfg 里 while (fgpid(jobs)==pid) sleep(1)；
+  eval 在 fork 前后阻塞 SIGCHLD，避免孩子先死、addjob 来不及登记。
+
+这些补上后更接近真实 shell，也避免作业表与僵尸堆积。
+
+
+七、测试命令备忘
+----------------
+  make clean && make
+  make rtestXX          # 参考输出
+  make testXX           # 自己的 tsh
+  对照 PID 以外的每一行；停住作业导致驱动挂起时 Ctrl-C 即可。
