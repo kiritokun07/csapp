@@ -75,16 +75,20 @@ function clear_dirs {
 }
 
 #
+# used_ports - TCP local ports currently in use.
+# Official cut -c21- | cut -d':' -f2 breaks on IPv6 listen addresses (:::8080).
+#
+function used_ports {
+    netstat -ant 2>/dev/null | awk 'NR>2 { addr=$4; sub(/.*:/, "", addr); print addr }' | tr "\n" " "
+}
+
+#
 # wait_for_port_use - Spins until the TCP port number passed as an
 #     argument is actually being used. Times out after 5 seconds.
 #
 function wait_for_port_use() {
     timeout_count="0"
-    portsinuse=`netstat --numeric-ports --numeric-hosts -a --protocol=tcpip \
-        | grep tcp | cut -c21- | cut -d':' -f2 | cut -d' ' -f1 \
-        | grep -E "[0-9]+" | uniq | tr "\n" " "`
-
-    echo "${portsinuse}" | grep -wq "${1}"
+    echo "$(used_ports)" | grep -wq "${1}"
     while [ "$?" != "0" ]
     do
         timeout_count=`expr ${timeout_count} + 1`
@@ -93,10 +97,7 @@ function wait_for_port_use() {
         fi
 
         sleep 1
-        portsinuse=`netstat --numeric-ports --numeric-hosts -a --protocol=tcpip \
-            | grep tcp | cut -c21- | cut -d':' -f2 | cut -d' ' -f1 \
-            | grep -E "[0-9]+" | uniq | tr "\n" " "`
-        echo "${portsinuse}" | grep -wq "${1}"
+        echo "$(used_ports)" | grep -wq "${1}"
     done
 }
 
@@ -112,11 +113,7 @@ function free_port {
 
     while [ TRUE ] 
     do
-        portsinuse=`netstat --numeric-ports --numeric-hosts -a --protocol=tcpip \
-            | grep tcp | cut -c21- | cut -d':' -f2 | cut -d' ' -f1 \
-            | grep -E "[0-9]+" | uniq | tr "\n" " "`
-
-        echo "${portsinuse}" | grep -wq "${port}"
+        echo "$(used_ports)" | grep -wq "${port}"
         if [ "$?" == "0" ]; then
             if [ $port -eq ${PORT_MAX} ]
             then

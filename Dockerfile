@@ -11,6 +11,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     valgrind \
     file \
     vim-tiny \
+    net-tools \
+    curl \
+    python3 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /csapp

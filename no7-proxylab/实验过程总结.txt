@@ -1,0 +1,172 @@
+CSAPP Proxy Lab（no7-proxylab）实验过程总结
+==========================================
+日期：2026-09-13
+环境：macOS Apple Silicon + Docker（./lab.sh shell，Linux amd64 容器）
+提交文件：proxy.c（可另加文件；助教按你的 Makefile 编译）
+方案：顺序 HTTP/1.0 转发 + 一连接一线程 + 进程内 LRU 缓存
+
+
+一、实验目标
+------------
+写一个并发、带缓存的 HTTP 代理。命令行：./proxy <port>
+只要求 GET。评分脚本 driver.sh 三块：
+
+  Basic        40  经 proxy 与直连 Tiny 拉同一批文件，diff 必须一致
+  Concurrency  15  nop-server 卡住一条连接时，另一条仍能被处理
+  Cache        15  预热后杀掉 Tiny，再拉 home.html 只能来自缓存
+
+本机 driver 结果：70/70。
+
+
+二、环境与工作流
+----------------
+1. 必须在 Linux 容器里跑 driver。Mac 上没有 Linux 版 netstat 参数，
+   且官方 driver 按列切端口，遇 IPv6（:::8080）会切空。
+
+2. 容器镜像起初缺 net-tools / curl / python3。
+   driver 用 netstat 等 listen、用 curl 拉文件、用 nop-server.py 制造阻塞。
+   缺谁都会表现为「分数为 0」或「Timeout waiting for the server」。
+   当前会话：
+     apt-get update && apt-get install -y net-tools curl python3
+   已写进 Dockerfile，下次 ./lab.sh build 后不必再装。
+
+3. tiny/tiny 若在 Mac 上编过，是 Mach-O arm64。driver 只检查 -x，
+   不检查 ELF，启动失败被 &> /dev/null 吃掉，于是一直等端口。
+   容器里必须：
+     (cd tiny && make clean && make)
+     file tiny/tiny    # 应是 ELF 64-bit，不是 Mach-O
+
+4. proxy 同样：Mac 上编的不能在容器里跑。Make 只看时间戳。
+     make clean && make
+
+5. nop-server.py 原 shebang 是 #!/usr/bin/python。
+   Ubuntu 22.04 只有 python3，脚本起不来，Concurrency 卡在等端口。
+   已改成 #!/usr/bin/env python3。
+
+6. driver.sh 的 used_ports 改为用 awk 取 Local Address 最后一个冒号后的
+   端口，兼容 0.0.0.0:port 和 :::port。这是本地环境补丁，不是评分点。
+
+
+三、底层模型
+------------
+Proxy 是中间人，不是 Web 服务器：不读磁盘，只在两条 TCP 之间搬字节。
+
+  浏览器/curl --proxy ──► proxy(listen) ──► 源站 Tiny
+                         │
+                         └─ 进程内 cache（按完整 URI）
+
+一条请求同时握着两个 fd：
+  connfd    Accept 来的客户端
+  serverfd  open_clientfd 连出去的源站
+listenfd 只留在主线程。
+
+TCP 是字节流，没有消息边界：
+  请求头边界 = 空行 \r\n
+  响应体边界 = 读到 EOF（我们发 Connection: close，源站关连接）
+  不能对 body 用 readline：jpg / 可执行文件里的 0x0a 不是换行语义。
+
+curl --proxy 发来的第一行通常是绝对 URI：
+  GET http://127.0.0.1:8000/home.html HTTP/1.1
+转发给 Tiny 必须改成相对路径、HTTP/1.0：
+  GET /home.html HTTP/1.0
+  Host: 127.0.0.1:8000
+  User-Agent: <规定那一行>
+  Connection: close
+  Proxy-Connection: close
+
+Tiny 的 parse_uri 把 /home.html 变成磁盘路径 ./home.html，不能抄。
+Proxy 的 parse_uri 拆的是「连谁、问什么」：host / port / path。
+
+
+四、按部分的实现过程
+--------------------
+
+【main / 线程】
+忽略 SIGPIPE：对端提前关掉后再 write，默认信号会杀进程。
+Open_listenfd 后循环 Accept。connfd 先 Malloc 拷到堆上再传给线程：
+栈上 &connfd 会被下一轮 Accept 改掉，worker 读到别人的 fd。
+worker：取出 fd、Pthread_detach、Free 参数、doit、Close(connfd)。
+Detach 避免僵尸线程。Concurrency 测的就是：nop-server 占着一个
+worker 时，主线程仍能 Accept，另一个 worker 去拉 Tiny。
+
+【doit】
+rio_readinitb + rio_readlineb 读请求行，sscanf 拆 method/uri/version。
+非 GET 直接返回。先 cache_lookup(完整 URI)；命中则写回客户端。
+未命中：parse_uri → build_request → open_clientfd（小写，失败不 exit）
+→ 把改写后的请求写出 → rio_readnb 循环把源站字节写给客户端，
+同时攒进 object[]。对象 ≤ MAX_OBJECT_SIZE 再 cache_insert。
+
+读写一律用小写 rio_* / open_clientfd。大写 Rio_writen / Open_clientfd
+失败会 unix_error → exit，客户端断开是常态，会把整个 proxy 打死。
+
+【parse_uri】
+拷一份 uri 再切，避免改调用方缓冲区。
+跳过 ://；第一个 / 起是 path（没有则 "/"）；权威部分里的 : 右边是端口，
+缺省 "80"。
+  http://localhost:8000/home.html  → localhost / 8000 / /home.html
+  http://localhost/csapp.c         → localhost / 80   / /csapp.c
+
+【build_request】
+请求行写成 GET path HTTP/1.0。读完客户端头：
+  Host 原样留下（没有则按 hostname[:port] 补）
+  User-Agent / Connection / Proxy-Connection 丢掉，改发规定值
+  其余头转发
+最后空行结束。Connection: close 让源站关连接，proxy 才能靠 EOF
+判断 body 结束，也避免 Tiny 用 HTTP/1.1 长连接挂住。
+
+【cache】
+双向链表，头 MRU、尾 LRU。节点：uri、data、size。
+整块上限 MAX_CACHE_SIZE（约 1MB），单对象上限 MAX_OBJECT_SIZE（100KB）。
+key 用请求行里的完整 URI，避免两个源站都叫 /home.html 时撞车。
+lookup 命中也要前移，改的是链表指针，所以用 wrlock，不是 rdlock。
+insert：空间不够就从 tail 踢，直到放得下。
+超大对象仍完整转发给客户端，只是不入库。转发和入库是两件事。
+
+driver 的 Cache 测法：先经 proxy 拉 tiny.c / home.html / csapp.c，
+杀掉 Tiny，再拉 home.html。源站已死，只能命中缓存。
+
+
+五、踩过的坑（按出现顺序）
+--------------------------
+- 官方 driver 依赖 netstat，容器里没有 → 等端口超时
+- 装了 netstat 仍超时：tiny 是 Mac 上编的 Mach-O，静默启动失败
+- 官方 cut -c21- | cut -d':' -f2 解析不了 IPv6 listen 地址
+- 没有 curl：Basic 两边都空文件，diff 失败，0/40，看起来像 proxy 错了
+- nop-server.py 的 /usr/bin/python 不存在，Concurrency 再超时
+- Tiny 必须在 tiny/ 目录启动，cwd 不对会 404（stat ./home.html）
+- 大写 Rio_* 封装在对端断开时会退出整个进程
+- 传栈上 connfd 给线程会和 Accept 数据竞争
+- 对 jpg 用 readline 会在 0x0a 处切错
+
+
+六、测试结果
+------------
+容器内 ./driver.sh：
+
+  basicScore:        40/40
+  concurrencyScore:  15/15
+  cacheScore:        15/15
+  totalScore:        70/70
+
+Basic 覆盖：home.html、csapp.c、tiny.c、godzilla.jpg、可执行文件 tiny。
+Concurrency：nop-server 永不回包，同时拉 Tiny 的 home.html 成功。
+Cache：杀 Tiny 后 home.html 仍与 tiny/home.html 一致。
+
+
+七、测试命令备忘
+----------------
+  ./lab.sh shell
+  cd no7-proxylab
+  make clean && make
+  (cd tiny && make clean && make)
+  file proxy tiny/tiny          # 都应是 ELF
+  ./driver.sh
+
+手工（两个终端，Tiny 必须在 tiny/ 下启动）：
+  (cd tiny && ./tiny 8000)
+  ./proxy 8080
+  curl --proxy http://127.0.0.1:8080 http://127.0.0.1:8000/home.html
+  curl --proxy http://127.0.0.1:8080 http://127.0.0.1:8000/godzilla.jpg -o /tmp/g.jpg
+
+提交：
+  make handin
