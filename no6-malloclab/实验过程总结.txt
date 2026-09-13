@@ -1,0 +1,167 @@
+CSAPP Malloc Lab（no6-malloclab）实验过程总结
+============================================
+日期：2026-09-13
+环境：macOS Apple Silicon + Docker（./lab.sh shell，Linux amd64 容器，gcc -m32）
+提交文件：mm.c（唯一应修改的文件）
+方案：隐式空闲链表 + first-fit + 立即合并 + 边界标记（header/footer）
+
+
+一、实验目标
+------------
+在 memlib 模拟的连续堆上实现 mm_init / mm_malloc / mm_free / mm_realloc。
+不能调用 libc 的 malloc；向 OS 要空间只用 mem_sbrk。返回指针 8 字节对齐，
+payload 不重叠。评分（有官方 trace 时）= 60% 利用率 + 40% 吞吐。
+
+利用率 = 应用同时占用的 payload 峰值 / mem_heapsize()。
+mem_sbrk 只能升高 brk，free 必须复用空洞，否则分母只增不减。
+
+
+二、环境与工作流
+----------------
+1. Makefile 带 -m32。Apple Silicon 上本机链接报 ld: unknown -arch name: armv4t。
+   必须在容器里编：
+     ./lab.sh shell
+     cd no6-malloclab
+     make clean && make
+
+2. 在 Mac 上 make 过再进容器，残留的 .o 是 Mach-O，Linux 链接器报
+   file format not recognized。Make 只看时间戳，不看 ELF/Mach-O。
+   必须 make clean 后重编。
+
+3. 容器是 QEMU 模拟的 amd64，再跑 -m32 程序时 gdb 报
+   Couldn't get registers: Input/output error。
+   看堆用 printf：把 mem_heap_lo() 当成 unsigned int * 打前几个字。
+   mdriver 会多次 mm_init，打印会重复出现；确认后立刻删掉，否则拖慢吞吐。
+
+4. 仓库里只有 short1-bal.rep / short2-bal.rep。config.h 默认 TRACEDIR
+   指向 CMU AFS，这台机器上没有官方 11 条 trace。
+   short 的 Perf index 不能当课程分数。
+
+
+三、底层模型
+------------
+堆是一段连续虚拟地址。块靠 header 里的 size 串成隐式链表：
+  NEXT_BLKP 用当前 header 的 size 往后跳；
+  PREV_BLKP 用前一块 footer 的 size 往前跳。
+
+一个字 4 字节（WSIZE），对齐单位 8 字节（DSIZE）。
+块大小是 8 的倍数，低 3 位恒为 0，最低 1 位借给 alloc：
+  PACK(size, alloc) = size | alloc
+  GET_SIZE 清掉低 3 位，GET_ALLOC 取最低位。
+
+bp 是 payload 指针（malloc 返回值）：
+  HDRP(bp) = bp - 4
+  FTRP(bp) 依赖 header 里已经写好的 size，所以必须先写头再写脚。
+
+最小块 16 字节：头 4 + 至少 8 + 脚 4。
+
+哨兵（mm_init 写的 16 字节）：
+  [pad 0][序言 8|1][序言脚 8|1][结尾 0|1]
+  pad 让 payload 落在 8 对齐处。
+  序言永远已分配：coalesce 看前一块时不会走出堆头。
+  结尾 size=0：find_fit 扫到 0 就停。
+  heap_listp 指向序言的 bp（start+8）。
+
+extend_heap：mem_sbrk 返回旧 brk，正好是旧结尾 header 后面。
+HDRP(新bp) 覆盖旧结尾，变成新空闲块的头；新堆顶再钉一个结尾。
+
+
+四、按步骤的实现过程
+--------------------
+
+【宏】
+WSIZE / DSIZE / CHUNKSIZE(4KB) / PACK / GET / PUT /
+GET_SIZE / GET_ALLOC / HDRP / FTRP / NEXT_BLKP / PREV_BLKP。
+指针加减必须先转 char *，否则按元素跳，不是按字节。
+
+【mm_init】
+mem_sbrk(4*WSIZE)，失败比较 (void *)-1 不是 NULL。
+四个字写成 0, PACK(8,1), PACK(8,1), PACK(0,1)。
+heap_listp += 2*WSIZE 后调用 extend_heap(CHUNKSIZE/WSIZE)。
+printf 验证堆头：0 9 9 1。
+
+【extend_heap】
+字数若为奇数则 +1，再乘 WSIZE，保证整块 8 对齐。
+PUT 头、脚 PACK(size,0)，再 PUT 新结尾 PACK(0,1)，然后 coalesce。
+第一次扩展邻居是序言和结尾，走 coalesce 的「11」。
+验证：free block size=4096 alloc=0  epilogue=0/1。
+此时 malloc 仍是 naive，多出来的 4KB 用不上，short1 util 从 50% 掉到 40%。
+
+【coalesce 四种情况】
+先读 prev_alloc（前一块 footer）、next_alloc（后一块 header）。
+  11：直接 return bp（当前块此时已标空闲）。
+  10：和后合并。先改当前 header 为新 size，再 FTRP（脚落到后一块旧脚）。
+  01：和前合并。先 PUT(FTRP(bp), 新size)（当前头未改，脚仍是当前块末尾），
+      再改前一块 header，bp = PREV_BLKP(bp)。
+  00：新头=前一块头，新脚=后一块脚，bp 挪到前一块。
+错法：01 写成 FTRP(PREV_BLKP(bp)) 会改到前一块旧脚（合并后在正中间）；
+      00 改当前块头脚会按超大 size 写出界。
+short 在接上 malloc/free 之前测不到 01/00，必须先改对再往下写。
+
+【find_fit】
+从 heap_listp 走到 GET_SIZE==0。未分配且 size>=asize 则返回，否则 NULL。
+错法：while (已分配 && 太小) 会在「空闲但太小」处停住，
+      扫到结尾后还会 NEXT_BLKP 出堆。
+
+【place】
+先 csize = GET_SIZE(HDRP(bp))，再决定拆不拆。
+余量 >= 16：前半 PACK(asize,1)，再 NEXT_BLKP，后半 PACK(余量,0)。
+否则整块 PACK(csize,1)，不要用 asize，否则留下无主空隙。
+错法：先 PUT(asize) 再读 csize，此时 csize==asize，拆分永远不走，
+      find_fit 把余量里的垃圾当 header，short1 直接 segfault。
+
+【malloc / free】
+asize：size<=8 则为 16，否则 (size+8) 向上取整到 8 的倍数。
+find_fit 成功则 place；否则 extend_heap(max(asize,CHUNKSIZE)/WSIZE) 再 place。
+返回 bp，不再 + SIZE_T_SIZE。
+free：HDRP(bp) 已经减 4，不要再减 naive 的 SIZE_T_SIZE。
+标空闲后 coalesce。
+
+【realloc】
+malloc + memcpy + free。拷贝长度用 GET_SIZE(HDRP(oldptr))-DSIZE。
+尚未处理 ptr==NULL / size==0（官方 realloc trace 会打）。
+
+
+五、踩过的坑（按出现顺序）
+--------------------------
+- Mac 上 -m32 链不过；容器里沿用 Mach-O 的 .o
+- 容器里 gdb 读不了 32 位进程寄存器，只能 printf
+- PUT 的第二个参数留成注释，不是合法 C
+- coalesce 01/00 改错了头脚位置
+- find_fit 用 && 当循环条件，空闲小块或结尾会停错/越界
+- free 把 payload 再减 SIZE_T_SIZE
+- place 先改 header 再读 csize，拆分失效后 segfault
+- 在 mm_init 里 extend 了 4KB 却仍用 naive malloc，util 假性下降
+- 用 short 的 80/94 分当成课程分数（没有官方 trace）
+
+
+六、测试结果（仅本地 short）
+----------------------------
+naive 起步：
+  short1  valid yes  util 50%  Perf 70/100（free 空操作，吞吐虚高）
+
+隐式链表完成后：
+  short1  valid yes  util 66%  Perf 80/100
+  short2  valid yes  util 89%  Perf 94/100
+
+short2 更高：先连续分配再连续释放，交错碎片少。
+short1 有 free 小块再 malloc 大块，外部碎片更多。
+
+
+七、尚未做的部分
+----------------
+- realloc：ptr==NULL 当 malloc；size==0 当 free 并返回 NULL
+- 官方 11 条 trace 上的正确性与 Perf index
+- first-fit 每次从堆头扫，大 trace 吞吐会掉；要冲分需
+  显式空闲链表或分离空闲链表，以及 realloc 原地扩展
+
+文件头仍写着 mm-naive.c，交作业前应改成方案说明。
+
+
+八、测试命令备忘
+----------------
+  make clean && make
+  ./mdriver -V -f short1-bal.rep
+  ./mdriver -V -f short2-bal.rep
+  ./mdriver -V -t <官方trace目录>     # 有 trace 包之后
+  ./mdriver -h
